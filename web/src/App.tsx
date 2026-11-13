@@ -6,6 +6,7 @@ import type { Meta } from './types';
 import LoginPage from './pages/LoginPage';
 import SamplesPage from './pages/SamplesPage';
 import SuggestionsPage from './pages/SuggestionsPage';
+import TrialPage from './pages/TrialPage';
 import ReviewPage from './pages/ReviewPage';
 import FilterBar from './components/FilterBar';
 
@@ -23,6 +24,7 @@ function Shell() {
         <nav>
           <NavLink to="/samples">需求还原</NavLink>
           <NavLink to="/suggestions">建议与订货</NavLink>
+          <NavLink to="/trials">新品试销</NavLink>
           <NavLink to="/review">收市复盘</NavLink>
         </nav>
         <div className="user">
@@ -38,6 +40,7 @@ function Shell() {
           <Route path="/" element={<Navigate to="/suggestions" replace />} />
           <Route path="/samples" element={<SamplesPage meta={meta} />} />
           <Route path="/suggestions" element={<SuggestionsPage meta={meta} />} />
+          <Route path="/trials" element={<TrialPage meta={meta} />} />
           <Route path="/review" element={<ReviewPage meta={meta} />} />
           <Route path="*" element={<Navigate to="/suggestions" replace />} />
         </Routes>

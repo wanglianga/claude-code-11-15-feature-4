@@ -3,6 +3,20 @@ import { pool } from './db';
 import { requireAuth, requireRole, scopeStoreId, signToken, verifyPassword } from './auth';
 import { confirmOrder, generateSuggestion, ConflictError, NotFoundError } from './services/suggestionService';
 import { addStocktake, addWasteRecord, createReview, submitReviewEntry } from './services/reviewService';
+import {
+  checkGraduation,
+  confirmTrialOrder,
+  createDecision,
+  createPlan,
+  deleteObservation,
+  graduatePlan,
+  getPlanDetail,
+  invalidateReferences,
+  listPlans,
+  referenceCatalog,
+  saveReferences,
+  upsertObservation,
+} from './services/trialService';
 
 function num(v: unknown, name: string): number {
   const n = Number(v);
@@ -60,9 +74,9 @@ export function createApp() {
   app.get('/api/meta', async (_req, res, next) => {
     try {
       const [stores, categories, skus, costParams, params] = await Promise.all([
-        pool().query('SELECT id, code, name FROM stores ORDER BY id'),
+        pool().query('SELECT id, code, name, store_type, district FROM stores ORDER BY id'),
         pool().query('SELECT id, code, name, default_cu, default_co FROM categories ORDER BY id'),
-        pool().query('SELECT id, category_id, code, name, unit, min_order_unit, price, cost, is_new FROM skus ORDER BY id'),
+        pool().query('SELECT id, category_id, code, name, unit, min_order_unit, price, cost, spec, is_new FROM skus ORDER BY id'),
         pool().query('SELECT store_id, category_id, cu, co FROM cost_params ORDER BY id'),
         pool().query('SELECT key, value FROM system_params'),
       ]);
@@ -295,6 +309,190 @@ export function createApp() {
         [storeId, businessDate],
       );
       res.json({ stocktakes: r.rows });
+    } catch (e) { next(e); }
+  });
+
+  // ---------- 新店新品试销 ----------
+  // 参照商品目录：按 店型/商圈/规格 给出各营业时段等价有货小时
+  app.get('/api/trials/catalog', async (req, res, next) => {
+    try {
+      const storeId = resolveStore(req, req.query.storeId);
+      const out = await referenceCatalog(storeId, optStr(req.query.spec));
+      res.json(out);
+    } catch (e) { next(e); }
+  });
+
+  app.get('/api/trials', async (req, res, next) => {
+    try {
+      const storeId = resolveStore(req, req.query.storeId);
+      res.json({ plans: await listPlans(storeId) });
+    } catch (e) { next(e); }
+  });
+
+  app.post('/api/trials', async (req, res, next) => {
+    try {
+      const result = await createPlan({
+        storeId: resolveStore(req, req.body?.storeId),
+        skuId: num(req.body?.skuId, 'skuId'),
+        arrivalDate: str(req.body?.arrivalDate, 'arrivalDate'),
+        periods: req.body?.periods,
+        references: Array.isArray(req.body?.references)
+          ? req.body.references.map((r: Record<string, unknown>) => ({
+              period: str(r.period, 'references.period'),
+              refSkuId: num(r.refSkuId, 'references.refSkuId'),
+              hours: r.hours === undefined || r.hours === null ? undefined : num(r.hours, 'references.hours'),
+            }))
+          : undefined,
+        createdBy: req.user!.username,
+      });
+      res.json(result);
+    } catch (e) { next(e); }
+  });
+
+  app.get('/api/trials/:id', async (req, res, next) => {
+    try {
+      const planId = num(req.params.id, 'id');
+      const detail = await getPlanDetail(planId);
+      const scoped = scopeStoreId(req, detail.plan.store_id);
+      if (scoped === null) throw new ConflictError('FORBIDDEN', '门店账号只能查看本店数据');
+      res.json(detail);
+    } catch (e) { next(e); }
+  });
+
+  // 参照设定（按版本保存）
+  app.post('/api/trials/:id/references', async (req, res, next) => {
+    try {
+      const planId = num(req.params.id, 'id');
+      const check = await getPlanDetail(planId);
+      if (scopeStoreId(req, check.plan.store_id) === null) throw new ConflictError('FORBIDDEN', '门店账号只能操作本店数据');
+      const lines = Array.isArray(req.body?.lines) ? req.body.lines : [];
+      if (lines.length === 0) throw new ConflictError('BAD_REQUEST', '参照明细不能为空');
+      const result = await saveReferences({
+        planId,
+        lines: lines.map((l: Record<string, unknown>) => ({
+          period: str(l.period, 'lines.period'),
+          refSkuId: num(l.refSkuId, 'lines.refSkuId'),
+          hours: l.hours === undefined || l.hours === null ? undefined : num(l.hours, 'lines.hours'),
+        })),
+        idempotencyKey: str(req.body?.idempotencyKey, 'idempotencyKey'),
+        createdBy: req.user!.username,
+      });
+      res.json(result);
+    } catch (e) { next(e); }
+  });
+
+  // 参照失效：只重估未确认计划，已确认订货记录保留
+  app.post('/api/trials/:id/references/invalidate', async (req, res, next) => {
+    try {
+      const planId = num(req.params.id, 'id');
+      const check = await getPlanDetail(planId);
+      if (scopeStoreId(req, check.plan.store_id) === null) throw new ConflictError('FORBIDDEN', '门店账号只能操作本店数据');
+      const result = await invalidateReferences({
+        planId,
+        reason: str(req.body?.reason, 'reason'),
+        createdBy: req.user!.username,
+      });
+      res.json(result);
+    } catch (e) { next(e); }
+  });
+
+  // 每日观测（修订号管理；importKey 幂等；重复导入不重复累加）
+  app.post('/api/trials/:id/observations', async (req, res, next) => {
+    try {
+      const planId = num(req.params.id, 'id');
+      const check = await getPlanDetail(planId);
+      if (scopeStoreId(req, check.plan.store_id) === null) throw new ConflictError('FORBIDDEN', '门店账号只能操作本店数据');
+      const result = await upsertObservation({
+        planId,
+        businessDate: str(req.body?.businessDate, 'businessDate'),
+        period: str(req.body?.period, 'period'),
+        status: str(req.body?.status, 'status'),
+        actualSales: req.body?.actualSales === undefined ? 0 : num(req.body.actualSales, 'actualSales'),
+        inStockHours: req.body?.inStockHours === undefined || req.body?.inStockHours === null
+          ? null : num(req.body.inStockHours, 'inStockHours'),
+        selloutTime: optStr(req.body?.selloutTime),
+        wasteQty: req.body?.wasteQty === undefined || req.body?.wasteQty === null ? 0 : num(req.body.wasteQty, 'wasteQty'),
+        importKey: optStr(req.body?.importKey),
+        revisionReason: optStr(req.body?.revisionReason),
+        createdBy: req.user!.username,
+      });
+      res.json(result);
+    } catch (e) { next(e); }
+  });
+
+  app.delete('/api/trials/:id/observations/:obsId', async (req, res, next) => {
+    try {
+      const planId = num(req.params.id, 'id');
+      const check = await getPlanDetail(planId);
+      if (scopeStoreId(req, check.plan.store_id) === null) throw new ConflictError('FORBIDDEN', '门店账号只能操作本店数据');
+      const result = await deleteObservation({
+        planId, observationId: num(req.params.obsId, 'obsId'), createdBy: req.user!.username,
+      });
+      res.json(result);
+    } catch (e) { next(e); }
+  });
+
+  // 试销决策：add 加订 / observe 继续观察 / stop 停止试销
+  app.post('/api/trials/:id/decisions', async (req, res, next) => {
+    try {
+      const planId = num(req.params.id, 'id');
+      const check = await getPlanDetail(planId);
+      if (scopeStoreId(req, check.plan.store_id) === null) throw new ConflictError('FORBIDDEN', '门店账号只能操作本店数据');
+      const action = str(req.body?.action, 'action');
+      if (!['add', 'observe', 'stop'].includes(action)) throw new ConflictError('BAD_REQUEST', '未知决策动作');
+      const result = await createDecision({
+        planId,
+        action: action as 'add' | 'observe' | 'stop',
+        batchQty: req.body?.batchQty === undefined || req.body?.batchQty === null
+          ? undefined : num(req.body.batchQty, 'batchQty'),
+        note: optStr(req.body?.note),
+        idempotencyKey: str(req.body?.idempotencyKey, 'idempotencyKey'),
+        estimateId: req.body?.estimateId === undefined || req.body?.estimateId === null
+          ? undefined : num(req.body.estimateId, 'estimateId'),
+        createdBy: req.user!.username,
+      });
+      res.json(result);
+    } catch (e) { next(e); }
+  });
+
+  // 店长确认订货记录（首批 / 追加）；停止后确认旧决策 → 409 + 待处理列表
+  app.post('/api/trials/:id/confirmations', async (req, res, next) => {
+    try {
+      const planId = num(req.params.id, 'id');
+      const check = await getPlanDetail(planId);
+      if (scopeStoreId(req, check.plan.store_id) === null) throw new ConflictError('FORBIDDEN', '门店账号只能操作本店数据');
+      const kind = str(req.body?.kind, 'kind');
+      if (kind !== 'initial' && kind !== 'add') throw new ConflictError('BAD_REQUEST', 'kind 只能是 initial / add');
+      const result = await confirmTrialOrder({
+        planId,
+        decisionId: req.body?.decisionId === undefined || req.body?.decisionId === null
+          ? undefined : num(req.body.decisionId, 'decisionId'),
+        qty: num(req.body?.qty, 'qty'),
+        kind,
+        idempotencyKey: str(req.body?.idempotencyKey, 'idempotencyKey'),
+        confirmedBy: req.user!.username,
+      });
+      res.json(result);
+    } catch (e) { next(e); }
+  });
+
+  // 转正检查 / 转正
+  app.get('/api/trials/:id/graduation', async (req, res, next) => {
+    try {
+      const planId = num(req.params.id, 'id');
+      const check = await getPlanDetail(planId);
+      if (scopeStoreId(req, check.plan.store_id) === null) throw new ConflictError('FORBIDDEN', '门店账号只能查看本店数据');
+      res.json(await checkGraduation(planId));
+    } catch (e) { next(e); }
+  });
+
+  app.post('/api/trials/:id/graduate', async (req, res, next) => {
+    try {
+      const planId = num(req.params.id, 'id');
+      const check = await getPlanDetail(planId);
+      if (scopeStoreId(req, check.plan.store_id) === null) throw new ConflictError('FORBIDDEN', '门店账号只能操作本店数据');
+      const result = await graduatePlan({ planId, createdBy: req.user!.username });
+      res.json(result);
     } catch (e) { next(e); }
   });
 

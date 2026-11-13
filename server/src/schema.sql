@@ -4,7 +4,9 @@
 CREATE TABLE IF NOT EXISTS stores (
   id   SERIAL PRIMARY KEY,
   code TEXT UNIQUE NOT NULL,
-  name TEXT NOT NULL
+  name TEXT NOT NULL,
+  store_type TEXT NOT NULL DEFAULT '社区店',  -- 店型（参照商品匹配维度）
+  district   TEXT NOT NULL DEFAULT '住宅区'   -- 商圈（参照商品匹配维度）
 );
 
 CREATE TABLE IF NOT EXISTS categories (
@@ -24,8 +26,13 @@ CREATE TABLE IF NOT EXISTS skus (
   min_order_unit NUMERIC NOT NULL DEFAULT 1,  -- 最小订货单位，建议量向上取整到它的整数倍
   price          NUMERIC NOT NULL,   -- 售价
   cost           NUMERIC NOT NULL,   -- 成本（报损单位成本基准）
+  spec           TEXT NOT NULL DEFAULT '500g装', -- 规格（参照商品匹配维度）
   is_new         BOOLEAN NOT NULL DEFAULT FALSE  -- 新品无历史，走品类先验
 );
+
+ALTER TABLE stores ADD COLUMN IF NOT EXISTS store_type TEXT NOT NULL DEFAULT '社区店';
+ALTER TABLE stores ADD COLUMN IF NOT EXISTS district TEXT NOT NULL DEFAULT '住宅区';
+ALTER TABLE skus ADD COLUMN IF NOT EXISTS spec TEXT NOT NULL DEFAULT '500g装';
 
 -- 门店×品类成本参数覆盖：同品类不同门店允许不同
 CREATE TABLE IF NOT EXISTS cost_params (
@@ -204,3 +211,134 @@ INSERT INTO system_params(key, value) VALUES
   ('waste_window_hour', '12'),             -- 报损补录窗口：次日 12:00 前
   ('rounding', 'ceil_to_min_order_unit')   -- 建议量向上取整到最小订货单位
 ON CONFLICT (key) DO NOTHING;
+
+-- =====================================================================
+-- 新店新品试销：参照设定 / 每日观测（修订号）/ 试销决策 / 确认记录 / 估计版本
+-- 三类数据分别保存；参照失效只重估未确认计划，已确认订货记录按当时快照冻结。
+-- =====================================================================
+
+-- 参照商品按 店型/商圈/规格/营业时段 的等价有货小时统计（历史参照样本）
+CREATE TABLE IF NOT EXISTS trial_reference_stats (
+  id                SERIAL PRIMARY KEY,
+  store_type        TEXT NOT NULL,
+  district          TEXT NOT NULL,
+  spec              TEXT NOT NULL,
+  ref_sku_id        INT NOT NULL REFERENCES skus(id),
+  period            TEXT NOT NULL,           -- morning / midday / evening
+  ref_sales_qty     NUMERIC NOT NULL,        -- 参照商品该时段销量
+  ref_in_stock_hours NUMERIC NOT NULL,       -- 折算的等价有货小时
+  sample_days       INT NOT NULL DEFAULT 14,
+  UNIQUE(store_type, district, spec, ref_sku_id, period)
+);
+
+CREATE TABLE IF NOT EXISTS trial_plans (
+  id                SERIAL PRIMARY KEY,
+  store_id          INT NOT NULL REFERENCES stores(id),
+  sku_id            INT NOT NULL REFERENCES skus(id),
+  arrival_date      DATE NOT NULL,           -- 首批到货营业日
+  status            TEXT NOT NULL DEFAULT 'selling',  -- selling / stopped / graduated
+  periods           TEXT[] NOT NULL,         -- 参与试销的营业时段
+  store_type        TEXT NOT NULL,
+  district          TEXT NOT NULL,
+  spec              TEXT NOT NULL,
+  stopped_at        TIMESTAMPTZ,
+  stop_reason       TEXT,
+  stopped_estimate_id INT,                   -- 停止时的估计版本（保留当时参照/观测/决定）
+  graduated_at      TIMESTAMPTZ,
+  graduated_snapshot JSONB,                  -- 转正时冻结的参照、观测、决定、覆盖检查
+  created_by        TEXT NOT NULL,
+  created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE(store_id, sku_id, arrival_date)
+);
+
+-- 参照设定：按版本保存；失效只产生新版本，历史版本只读
+CREATE TABLE IF NOT EXISTS trial_reference_sets (
+  id                SERIAL PRIMARY KEY,
+  plan_id           INT NOT NULL REFERENCES trial_plans(id),
+  revision_no       INT NOT NULL,
+  invalidated       BOOLEAN NOT NULL DEFAULT FALSE,
+  invalidated_reason TEXT,
+  idempotency_key   TEXT UNIQUE NOT NULL,
+  created_by        TEXT NOT NULL,
+  created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE(plan_id, revision_no)
+);
+
+CREATE TABLE IF NOT EXISTS trial_reference_lines (
+  id                 SERIAL PRIMARY KEY,
+  set_id             INT NOT NULL REFERENCES trial_reference_sets(id),
+  period             TEXT NOT NULL,
+  ref_sku_id         INT NOT NULL REFERENCES skus(id),
+  ref_sales_qty      NUMERIC NOT NULL,
+  ref_in_stock_hours NUMERIC NOT NULL,
+  UNIQUE(set_id, period)
+);
+
+-- 每日观测：修订号管理；is_current 只有一行生效，后补时旧修订撤掉贡献
+CREATE TABLE IF NOT EXISTS trial_observations (
+  id              SERIAL PRIMARY KEY,
+  plan_id         INT NOT NULL REFERENCES trial_plans(id),
+  business_date   DATE NOT NULL,
+  period          TEXT NOT NULL,
+  revision_no     INT NOT NULL,
+  is_current      BOOLEAN NOT NULL DEFAULT TRUE,
+  superseded_by   INT,
+  status          TEXT NOT NULL,   -- operating / sold_out / no_stock / closed / missing
+  actual_sales    NUMERIC NOT NULL DEFAULT 0,
+  in_stock_hours  NUMERIC NOT NULL DEFAULT 0,
+  waste_qty       NUMERIC NOT NULL DEFAULT 0,
+  import_key      TEXT,
+  revision_reason TEXT,
+  created_by      TEXT NOT NULL,
+  created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE(plan_id, business_date, period, revision_no)
+);
+
+-- 重复导入幂等：同一当前观测上的 import_key 只能有一行
+CREATE UNIQUE INDEX IF NOT EXISTS trial_obs_import_current
+  ON trial_observations(plan_id, import_key) WHERE is_current AND import_key IS NOT NULL;
+
+-- 试销决策：加订 / 继续观察 / 停止试销，各自保存，带当时估计快照
+CREATE TABLE IF NOT EXISTS trial_decisions (
+  id                SERIAL PRIMARY KEY,
+  plan_id           INT NOT NULL REFERENCES trial_plans(id),
+  action            TEXT NOT NULL,             -- add / observe / stop
+  status            TEXT NOT NULL,             -- pending_confirm / confirmed / observed / stopped
+  suggested_qty     NUMERIC NOT NULL DEFAULT 0,
+  batch_qty         NUMERIC NOT NULL DEFAULT 0,
+  basis_estimate_id INT,                      -- 决策依据的估计版本（估计版本表后建，故不加外键）
+  note              TEXT,
+  idempotency_key   TEXT UNIQUE NOT NULL,
+  created_by        TEXT NOT NULL,
+  created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+  confirmed_at      TIMESTAMPTZ
+);
+
+-- 店长确认的订货记录：永久保留；停止试销后不再并入计划，单列「待处理」
+CREATE TABLE IF NOT EXISTS trial_confirmations (
+  id                SERIAL PRIMARY KEY,
+  plan_id           INT NOT NULL REFERENCES trial_plans(id),
+  decision_id       INT REFERENCES trial_decisions(id),
+  kind              TEXT NOT NULL,             -- initial / add
+  qty               NUMERIC NOT NULL,
+  status            TEXT NOT NULL DEFAULT 'pending',  -- pending / stopped_pending
+  estimate_snapshot JSONB NOT NULL,            -- 确认时的估计快照（冻结，不随参照失效重算）
+  idempotency_key   TEXT UNIQUE NOT NULL,
+  confirmed_by      TEXT NOT NULL,
+  confirmed_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- 估计版本：参照/观测/成本每次变更产生新版本；确认过的版本冻结
+CREATE TABLE IF NOT EXISTS trial_estimates (
+  id                SERIAL PRIMARY KEY,
+  plan_id           INT NOT NULL REFERENCES trial_plans(id),
+  revision_no       INT NOT NULL,
+  trigger           TEXT NOT NULL,             -- initial / references / observations / reference_invalidated / decision
+  computed          JSONB NOT NULL,
+  basis_snapshot    JSONB NOT NULL,            -- 参照集版本、观测修订、成本标定快照
+  frozen            BOOLEAN NOT NULL DEFAULT FALSE,
+  frozen_by_confirmation_id INT,               -- 冻结该版本的确认记录
+  created_by        TEXT NOT NULL,
+  created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE(plan_id, revision_no)
+);
